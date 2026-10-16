@@ -12,9 +12,9 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- CONFIGURATION ----------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is not set.")
+    raise ValueError("TELEGRAM_BOT_TOKEN environment variable is not set.")
 
 BASE_URL = os.environ.get(
     "BASE_URL",
