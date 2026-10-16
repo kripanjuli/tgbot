@@ -544,7 +544,7 @@ async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 1:
         await update.message.reply_text(
-            "❌ Invalid format.\nUsage: /genkey <seconds>\n"
+            "\nUsage: /genkey <seconds>\n"
             "Example: /genkey 3600  (for 1 hour)"
         )
         return
