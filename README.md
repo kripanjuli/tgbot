@@ -1,18 +1,20 @@
-# Telegram TCP Reachability Monitor
+# Telegram Host Monitor (Render Web Service)
 
-A Render worker Telegram bot for low-rate TCP reachability checks. It does **not**
-send UDP floods or invoke an attack API.
+This bot runs as a Render Web Service with a small HTTP health endpoint at `/` and `/health`.
+It provides low-rate TCP reachability monitoring, not UDP attack traffic.
 
 ## Commands
 - `/start`
-- `/attack <public-ip> <port> <duration>` — checks TCP connectivity every 5 seconds, max 300 seconds.
+- `/attack <public-ip> <port> <duration>` — TCP connectivity checks every 5 seconds, duration 1–300 seconds.
 - `/status`
 - `/help`
 
-## Deploy on Render
-1. Push these files to a GitHub repository.
-2. In Render, create a new Blueprint from that repository, or create a Background Worker.
-3. Add environment variable `TELEGRAM_BOT_TOKEN` with the token from BotFather.
-4. Deploy. Keep only one worker instance running to avoid Telegram polling conflicts.
+## Deploy
+1. Upload these files to the root of a GitHub repository.
+2. Create a Render Web Service from the repository, or use the included Blueprint.
+3. Set `TELEGRAM_BOT_TOKEN` in Render Environment settings.
+4. Build command: `pip install -r requirements.txt`
+5. Start command: `python main.py`
 
-Only monitor hosts and ports you own or are authorized to test.
+Render supplies the `PORT` environment variable. The health server binds to `0.0.0.0:$PORT`.
+Use only on systems you own or are authorized to test.
