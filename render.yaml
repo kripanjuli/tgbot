@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: telegram-host-monitor
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
