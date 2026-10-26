@@ -1,4 +1,4 @@
-# Telegram TCP Monitor — Render Web Service
+# Telegram UDP Monitor — Render Web Service
 
 Provides an HTTP health endpoint (`/`, `/health`) and Telegram commands:
 - `/start`
@@ -6,7 +6,7 @@ Provides an HTTP health endpoint (`/`, `/health`) and Telegram commands:
 - `/status`
 - `/help`
 
-Jobs perform TCP reachability checks every 5 seconds for 1–300 seconds. The five numbered
+Jobs perform UDP reachability checks every 5 seconds for 1–300 seconds. The five numbered
 slots are local dashboard slots for active checks, not separate physical servers. This
 project does not invoke UDP attack APIs or send attack traffic.
 
